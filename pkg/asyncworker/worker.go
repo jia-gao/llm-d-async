@@ -332,7 +332,9 @@ func WorkerWithGateTimeout(consumeCtx, requestCtx context.Context, characteristi
 					logger.V(logutil.DEBUG).Info("Sending inference request", "url", msg.RequestURL)
 					metrics.RecordDispatchedReq(queueID, queueName, msg.WorkerPoolID)
 					inferenceStart := time.Now()
-					resp, err := client.SendRequest(reqCtx, msg.RequestURL, sendHeaders, sendPayload)
+					sendCtx, stopCancellationWatch := watchInflightCancellation(reqCtx, logger, msg)
+					resp, err := client.SendRequest(sendCtx, msg.RequestURL, sendHeaders, sendPayload)
+					cancelledInFlight := stopCancellationWatch()
 					metrics.RecordInferenceLatency(float64(time.Since(inferenceStart).Milliseconds()), queueID, queueName, msg.WorkerPoolID)
 
 					if err == nil {
@@ -362,6 +364,17 @@ func WorkerWithGateTimeout(consumeCtx, requestCtx context.Context, characteristi
 						retryChannel <- pipeline.RetryMessage{
 							EmbelishedRequestMessage: msg,
 							BackoffDurationSeconds:   0,
+						}
+						return
+					}
+
+					// The request was cancelled by its producer while inference was
+					// executing. A terminal response that arrived first was already
+					// returned above; otherwise surface CANCELLED and do not retry.
+					if cancelledInFlight {
+						select {
+						case resultChannel <- asyncapi.NewCancelledResult(msg.PublicRequest, msg.InternalRouting):
+						case <-requestCtx.Done():
 						}
 						return
 					}
@@ -625,6 +638,54 @@ func emitCancelledResultIfNeeded(
 	case <-ctx.Done():
 	}
 	return true
+}
+
+// watchInflightCancellation polls the request's cancellation marker while
+// inference is executing and cancels the returned context once the marker for
+// this request generation appears. The returned stop function ends polling and
+// reports whether the request was cancelled; it must be called once the send
+// returns. Without a cancellation checker, ctx is returned unchanged.
+func watchInflightCancellation(ctx context.Context, logger logr.Logger, msg pipeline.EmbelishedRequestMessage) (context.Context, func() bool) {
+	checker := cancellationCheckerFromContext(ctx)
+	if checker == nil || msg.PublicRequest == nil {
+		return ctx, func() bool { return false }
+	}
+	sendCtx, cancel := context.WithCancel(ctx)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var cancelled bool
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(cancellationCheckPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-sendCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			isCancelled, err := checker.IsCancelled(sendCtx, msg.PublicRequest.ReqID(), msg.RequestToken)
+			if err != nil {
+				// Fail open: a lookup error must not abort a request that may
+				// still complete. The next tick checks again.
+				logger.V(logutil.DEBUG).Info("Failed to check in-flight request cancellation", "id", msg.PublicRequest.ReqID(), "err", err)
+				continue
+			}
+			if isCancelled {
+				cancelled = true
+				cancel()
+				return
+			}
+		}
+	}()
+	return sendCtx, func() bool {
+		close(stop)
+		<-done
+		cancel()
+		return cancelled
+	}
 }
 
 // https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/
