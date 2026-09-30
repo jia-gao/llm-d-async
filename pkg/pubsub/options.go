@@ -50,14 +50,14 @@ func (c *Config) Validate() error {
 	if c.ProjectID == "" {
 		return fmt.Errorf("project_id is required for gcp-pubsub transport")
 	}
-	if c.ResultTopicID == "" && !c.allTopicsHaveResultTopic() {
-		return fmt.Errorf("result_topic_id is required for gcp-pubsub transport unless every topic sets its own result_topic_id")
-	}
 	if c.BatchSize <= 0 {
 		return fmt.Errorf("batch_size must be a positive integer, got %d", c.BatchSize)
 	}
 	if len(c.Topics) == 0 {
 		return fmt.Errorf("at least one topic must be configured")
+	}
+	if c.ResultTopicID == "" && !c.allTopicsHaveResultTopic() {
+		return fmt.Errorf("result_topic_id is required for gcp-pubsub transport unless every topic sets its own result_topic_id")
 	}
 	for _, t := range c.Topics {
 		if t.SubscriberID == "" {
@@ -73,9 +73,6 @@ func (c *Config) Validate() error {
 // allTopicsHaveResultTopic reports whether every topic entry overrides the
 // result destination, which makes the flow-level default unreachable.
 func (c *Config) allTopicsHaveResultTopic() bool {
-	if len(c.Topics) == 0 {
-		return false
-	}
 	for _, t := range c.Topics {
 		if t.ResultTopicID == "" {
 			return false

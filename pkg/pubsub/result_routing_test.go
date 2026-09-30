@@ -41,7 +41,7 @@ func TestLoadConfig_ResultTopicRequirement(t *testing.T) {
 		{
 			name:    "no topics and no flow default",
 			cfg:     `{"project_id":"p","topics":[]}`,
-			wantErr: "result_topic_id is required",
+			wantErr: "at least one topic must be configured",
 		},
 	}
 	for _, tt := range tests {
@@ -233,5 +233,41 @@ func TestResultWorker_NoDestinationNacks(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for result signal")
+	}
+}
+
+// TestResultWorker_PublishFailureNacks covers a result whose topic cannot be
+// published to (here: it does not exist). The publish error must be reported
+// as a failure so the request is Nacked and redelivered, not Acked and lost.
+func TestResultWorker_PublishFailureNacks(t *testing.T) {
+	srv, client, _ := newFakePubSubServer(t)
+
+	sig := make(chan bool, 1)
+	resultChannels.Store("c-missing", sig)
+	t.Cleanup(func() { resultChannels.Delete("c-missing") })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	resultCh := make(chan api.ResultMessage)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		resultWorker(ctx, client, "", resultCh)
+	}()
+	defer func() {
+		cancel()
+		<-stopped
+	}()
+
+	resultCh <- api.ResultMessage{ID: "r-missing", Routing: api.InternalRouting{TransportCorrelationID: "c-missing", ResultQueueName: "no-such-topic"}}
+	select {
+	case ok := <-sig:
+		if ok {
+			t.Fatal("expected failure signal for a result published to a missing topic")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for result signal")
+	}
+	if n := len(srv.Messages()); n != 0 {
+		t.Errorf("published %d messages, want 0", n)
 	}
 }

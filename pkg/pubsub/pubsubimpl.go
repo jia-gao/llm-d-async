@@ -13,6 +13,7 @@ import (
 	"cloud.google.com/go/monitoring/apiv3/v2/monitoringpb"
 	"cloud.google.com/go/pubsub/v2"
 	"cloud.google.com/go/pubsub/v2/apiv1/pubsubpb"
+	"github.com/go-logr/logr"
 	"github.com/llm-d/llm-d-async/api"
 	"github.com/llm-d/llm-d-async/pipeline"
 	"github.com/llm-d/llm-d-async/pkg/metrics"
@@ -434,14 +435,23 @@ var _ pipeline.BacklogReporter = (*PubSubMQFlow)(nil)
 // (msg.Routing.ResultQueueName), falling back to defaultTopicID. One Publisher
 // is cached per distinct result topic and stopped, flushing pending
 // publishes, when the worker exits.
+//
+// The request is only reported as done (and Acked) once the server has
+// accepted its result. A publish that fails, e.g. to a topic that does not
+// exist or that the service account cannot publish to, reports false so the
+// request is Nacked and redelivered instead of losing its result.
 func resultWorker(ctx context.Context, client *pubsub.Client, defaultTopicID string, resultChannel chan api.ResultMessage) {
 	logger := log.FromContext(ctx)
 
 	publishers := make(map[string]*pubsub.Publisher)
+	var pending sync.WaitGroup
 	defer func() {
+		// Stop returns once every outstanding publish has been sent or has
+		// failed, so the pending result waiters below finish promptly.
 		for _, p := range publishers {
 			p.Stop()
 		}
+		pending.Wait()
 	}()
 
 	for {
@@ -450,49 +460,64 @@ func resultWorker(ctx context.Context, client *pubsub.Client, defaultTopicID str
 			return
 
 		case msg := <-resultChannel:
-			published := false
+			correlationID := msg.Routing.TransportCorrelationID
 			topicID := msg.Routing.ResultQueueName
 			if topicID == "" {
 				topicID = defaultTopicID
 			}
 			if topicID == "" {
-				logger.V(logutil.DEFAULT).Error(nil, "No result topic resolved for message", "id", msg.ID, "pubsubID", msg.Routing.TransportCorrelationID)
-			} else {
-				publisher, ok := publishers[topicID]
-				if !ok {
-					publisher = client.Publisher(topicID)
-					publishers[topicID] = publisher
-				}
-				bytes, err := json.Marshal(msg)
-				var msgBytes []byte
-				if err != nil {
-					fallback := map[string]string{"id": msg.ID, "error": "Failed to marshal result to string"}
-					msgBytes, _ = json.Marshal(fallback)
-				} else {
-					msgBytes = bytes
-				}
-				publishPubSub(ctx, publisher, msgBytes, map[string]string{})
-				published = true
-			}
-			value, ok := resultChannels.Load(msg.Routing.TransportCorrelationID)
-			if !ok {
-				logger.V(logutil.DEFAULT).Error(nil, "Result channel not found for message", "pubsubID", msg.Routing.TransportCorrelationID)
+				logger.V(logutil.DEFAULT).Error(nil, "No result topic resolved for message", "id", msg.ID, "pubsubID", correlationID)
+				signalPublished(logger, correlationID, false)
 				continue
 			}
-			resultChannel := value.(chan bool)
-			resultChannel <- published
+			publisher, ok := publishers[topicID]
+			if !ok {
+				publisher = client.Publisher(topicID)
+				publishers[topicID] = publisher
+			}
+			bytes, err := json.Marshal(msg)
+			var msgBytes []byte
+			if err != nil {
+				fallback := map[string]string{"id": msg.ID, "error": "Failed to marshal result to string"}
+				msgBytes, _ = json.Marshal(fallback)
+			} else {
+				msgBytes = bytes
+			}
+			res := publishPubSub(ctx, publisher, msgBytes, map[string]string{})
 
+			// Wait for the server's answer off the loop so publishes keep
+			// batching. The wait is detached from ctx: on shutdown Stop flushes
+			// the publish, and its real outcome decides Ack vs. Nack.
+			pending.Add(1)
+			go func(id string) {
+				defer pending.Done()
+				if _, err := res.Get(context.WithoutCancel(ctx)); err != nil {
+					logger.V(logutil.DEFAULT).Error(err, "Failed to publish result", "id", id, "topic", topicID, "pubsubID", correlationID)
+					signalPublished(logger, correlationID, false)
+					return
+				}
+				signalPublished(logger, correlationID, true)
+			}(msg.ID)
 		}
 	}
 }
 
-func publishPubSub(ctx context.Context, publisher *pubsub.Publisher, msg []byte, attrs map[string]string) {
-	// TODO: check how to validate that message are actually being published
-	publisher.Publish(ctx, &pubsub.Message{
+// signalPublished tells the receive callback waiting on correlationID whether
+// its result was published, so it Acks or Nacks the request.
+func signalPublished(logger logr.Logger, correlationID string, published bool) {
+	value, ok := resultChannels.Load(correlationID)
+	if !ok {
+		logger.V(logutil.DEFAULT).Error(nil, "Result channel not found for message", "pubsubID", correlationID)
+		return
+	}
+	value.(chan bool) <- published
+}
+
+func publishPubSub(ctx context.Context, publisher *pubsub.Publisher, msg []byte, attrs map[string]string) *pubsub.PublishResult {
+	return publisher.Publish(ctx, &pubsub.Message{
 		Data:       msg,
 		Attributes: attrs,
 	})
-
 }
 
 func addMsgToRetryQueue(ctx context.Context, retryChannel chan pipeline.RetryMessage) {
