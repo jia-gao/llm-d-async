@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -643,30 +644,30 @@ func emitCancelledResultIfNeeded(
 // watchInflightCancellation polls the request's cancellation marker while
 // inference is executing and cancels the returned context once the marker for
 // this request generation appears. The returned stop function ends polling and
-// reports whether the request was cancelled; it must be called once the send
-// returns. Without a cancellation checker, ctx is returned unchanged.
+// reports whether the watcher cancelled the send; it must be called once the
+// send returns. Without a cancellation checker, ctx is returned unchanged.
 func watchInflightCancellation(ctx context.Context, logger logr.Logger, msg pipeline.EmbelishedRequestMessage) (context.Context, func() bool) {
 	checker := cancellationCheckerFromContext(ctx)
 	if checker == nil || msg.PublicRequest == nil {
 		return ctx, func() bool { return false }
 	}
 	sendCtx, cancel := context.WithCancel(ctx)
-	stop := make(chan struct{})
-	done := make(chan struct{})
-	var cancelled bool
+	var cancelled atomic.Bool
 	go func() {
-		defer close(done)
 		ticker := time.NewTicker(cancellationCheckPollInterval)
 		defer ticker.Stop()
 		for {
 			select {
-			case <-stop:
-				return
 			case <-sendCtx.Done():
 				return
 			case <-ticker.C:
 			}
 			isCancelled, err := checker.IsCancelled(sendCtx, msg.PublicRequest.ReqID(), msg.RequestToken)
+			if sendCtx.Err() != nil {
+				// The send already finished or was aborted while the lookup
+				// ran, so its answer no longer matters.
+				return
+			}
 			if err != nil {
 				// Fail open: a lookup error must not abort a request that may
 				// still complete. The next tick checks again.
@@ -674,17 +675,19 @@ func watchInflightCancellation(ctx context.Context, logger logr.Logger, msg pipe
 				continue
 			}
 			if isCancelled {
-				cancelled = true
+				cancelled.Store(true)
 				cancel()
 				return
 			}
 		}
 	}()
+	// Stop does not wait for a lookup still in flight: the Redis client does
+	// not abort a command on context cancellation by default, so waiting would
+	// let a slow Redis delay the result of a send that already finished. The
+	// flag is set before the watcher cancels the send, so it is reliable here.
 	return sendCtx, func() bool {
-		close(stop)
-		<-done
 		cancel()
-		return cancelled
+		return cancelled.Load()
 	}
 }
 
