@@ -626,12 +626,7 @@ func (r *PubSubMQFlow) processMessages(ctx context.Context, receive receiveFunc,
 		// refresh the passive health signal read by HealthCheck.
 		r.recordConsumeOK(subscriberID)
 
-		// result_queue_name is the same optional per-message routing field
-		// producers set on api.RedisRequest; here it names a result topic.
-		var wire struct {
-			api.RequestMessage
-			ResultQueueName string `json:"result_queue_name,omitempty"`
-		}
+		var wire api.PubSubRequest
 		err := json.Unmarshal(msg.Data, &wire)
 		if err != nil {
 			logger.V(logutil.DEFAULT).Error(err, "Failed to unmarshal message from request queue")

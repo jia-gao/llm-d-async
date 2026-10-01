@@ -355,7 +355,7 @@ Each entry in `queues`/`topics` describes one request source and where its reque
 |-------|----------|---------|-------------|
 | `result_topic_id` | no | top-level `result_topic_id` | Per-topic result destination override. |
 
-**Result routing precedence (`redis-sortedset` and `gcp-pubsub`):** the per-queue/per-topic result destination wins; otherwise a per-message `result_queue_name` (a field of the request message, naming a result topic on `gcp-pubsub`) is used; otherwise results go to the top-level default.
+**Result routing precedence (`redis-sortedset` and `gcp-pubsub`):** the per-queue/per-topic result destination wins; otherwise the per-message `ResultQueueName` (`result_queue_name` on `api.RedisRequest` / `api.PubSubRequest`; a result topic on `gcp-pubsub`) is used; otherwise results go to the top-level default.
 
 ### Worker Pools Configuration
 
